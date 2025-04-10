@@ -15,7 +15,6 @@ class TuyaClient
     protected $tokenCacheKey = 'tuya_access_token';
     protected $tokenCacheTime = 7200; // 2 jam, kurang dari masa berlaku token asli
     protected $debug = false;
-    protected $headers = [];
     
     /**
      * TuyaClient constructor.
@@ -51,16 +50,17 @@ class TuyaClient
     }
 
     /**
-     * Ngambil access token, kalo belum ada atau expired, minta yang baru
+     * Mendapatkan access token menggunakan metode terbaru
+     * https://developer.tuya.com/en/docs/iot/authentication-method?id=Ka49gbaxjygox
      */
     public function getAccessToken()
     {
-        // Untuk debugging, kita bisa clear cache
+        // Force clear cache for debugging if needed
         if ($this->debug) {
             Cache::forget($this->tokenCacheKey);
         }
         
-        // Cek dulu kalo token-nya masih ada di cache
+        // Cek dulu jika token sudah di cache
         if (Cache::has($this->tokenCacheKey)) {
             $this->debugLog('Using cached token');
             return Cache::get($this->tokenCacheKey);
@@ -68,42 +68,32 @@ class TuyaClient
 
         $this->debugLog('Requesting new token');
         
-        // Persiapkan parameter untuk request token
-        // Referensi implementasi: https://github.com/ground-creative/tuyapiphp/blob/master/src/Token.php
-        $timestamp = $this->getTimestamp();
+        // Timestamp dalam milidetik
+        $timestamp = round(microtime(true) * 1000);
         $nonce = Str::random(16);
         
-        // Sorting parameters by alphabetical order (like what the reference does)
-        $params = [
-            'grant_type' => 1
-        ];
-        
-        // Create URL
-        $url = $this->apiHost . '/v1.0/token';
-        $fullUrl = $url . '?' . http_build_query($params);
-        
-        // Sign string - using method similar to reference
-        $stringToSign = $this->buildStringToSign('GET', $url, $params, '');
-        $sign = $this->calcSign($stringToSign);
+        // Metode terbaru untuk signing token request (dari docs)
+        $stringToSign = $this->accessId . $timestamp;
+        $sign = strtoupper(hash_hmac('sha256', $stringToSign, $this->accessSecret));
         
         $this->debugLog('Token request details', [
-            'url' => $fullUrl,
+            'url' => $this->apiHost . '/v1.0/token?grant_type=1',
             'stringToSign' => $stringToSign,
             'timestamp' => $timestamp
         ]);
         
-        // Set headers
+        // Headers sesuai dokumentasi terbaru
         $headers = [
             'client_id' => $this->accessId,
             'sign' => $sign,
-            't' => $timestamp,
+            't' => (string)$timestamp,
             'sign_method' => 'HMAC-SHA256',
-            'nonce' => $nonce,
-            'Content-Type' => 'application/json'
+            'nonce' => $nonce
         ];
         
-        // Make request
-        $response = Http::withHeaders($headers)->get($fullUrl);
+        // Request token
+        $response = Http::withHeaders($headers)
+            ->get($this->apiHost . '/v1.0/token?grant_type=1');
         
         $this->debugLog('Token response', [
             'status' => $response->status(),
@@ -117,7 +107,7 @@ class TuyaClient
         
         $data = $response->json();
         
-        // Validate response format, similar to reference
+        // Validate response format
         if (!isset($data['success']) || $data['success'] !== true) {
             $errorMsg = isset($data['msg']) ? $data['msg'] : 'Unknown error';
             $errorCode = isset($data['code']) ? $data['code'] : 'unknown';
@@ -132,68 +122,39 @@ class TuyaClient
         $token = $data['result']['access_token'];
         $this->debugLog('Token obtained successfully');
         
-        // Simpen token ke cache - using expiration time from response if available
-        $expireTime = isset($data['result']['expire_time']) ? $data['result']['expire_time'] / 1000 - time() - 60 : $this->tokenCacheTime;
+        // Cache token
+        $expireTime = isset($data['result']['expire_time']) ? ($data['result']['expire_time'] / 1000) - time() - 60 : $this->tokenCacheTime;
         Cache::put($this->tokenCacheKey, $token, $expireTime);
         
         return $token;
     }
-    
-    /**
-     * Build string to sign (like in reference implementation)
-     */
-    protected function buildStringToSign($method, $url, $params = [], $body = '')
-    {
-        $urlParts = parse_url($url);
-        $path = isset($urlParts['path']) ? $urlParts['path'] : '';
-        
-        // Handle headers - blank for now as we don't use them in this implementation
-        $headers = '';
-        
-        // Get query params from URL if any
-        $urlQuery = isset($urlParts['query']) ? $urlParts['query'] : '';
-        
-        // Combine with method params
-        $allParams = [];
-        parse_str($urlQuery, $urlParams);
-        $allParams = array_merge($urlParams, $params);
-        
-        // Sort params similar to reference
-        ksort($allParams);
-        $queryString = http_build_query($allParams);
-        
-        // Prepare body hash
-        $bodyHash = '';
-        if (!empty($body)) {
-            if (is_array($body)) {
-                $body = json_encode($body);
-            }
-            $bodyHash = hash('sha256', $body);
-        } else {
-            $bodyHash = hash('sha256', '');
-        }
-        
-        // Assemble string to sign
-        $stringToSign = $method . "\n" . 
-                        $bodyHash . "\n" .
-                        $headers . "\n" .
-                        $path;
-        
-        // Add query params if exist
-        if (!empty($queryString)) {
-            $stringToSign .= '?' . $queryString;
-        }
-        
-        return $stringToSign;
-    }
 
     /**
-     * Bikin signature buat request
+     * Membuat signature untuk API request sesuai metode terbaru
+     * https://developer.tuya.com/en/docs/iot/new-singnature?id=Kbw0q34cs2e5g
      */
-    protected function calcSign(string $stringToSign, ?string $accessToken = null)
+    protected function calcSign(string $method, string $path, string $body = '', ?string $accessToken = null)
     {
+        // Prepare content hash
+        $contentHash = hash('sha256', $body);
+        
+        // Metode terbaru untuk signing API requests
+        $stringToSign = $method . "\n" .
+                        $contentHash . "\n" .
+                        '' . "\n" . // Headers is empty for now
+                        $path;
+        
+        $this->debugLog('Sign details', [
+            'method' => $method,
+            'path' => $path,
+            'stringToSign' => $stringToSign
+        ]);
+        
+        // Key untuk signing
         $key = $accessToken ? $this->accessSecret . $accessToken : $this->accessSecret;
-        return hash_hmac('sha256', $stringToSign, $key);
+        
+        // Generate signature (uppercase sesuai docs terbaru)
+        return strtoupper(hash_hmac('sha256', $stringToSign, $key));
     }
 
     /**
@@ -209,59 +170,57 @@ class TuyaClient
      */
     public function request(string $method, string $path, array $params = [], array $body = [])
     {
-        $token = $this->getAccessToken();
-        $timestamp = $this->getTimestamp();
-        $nonce = Str::random(16);
-        
         // Ensure path starts with /
         if (substr($path, 0, 1) !== '/') {
             $path = '/' . $path;
         }
         
+        // Get token first
+        $token = $this->getAccessToken();
+        
+        // Prepare request details
+        $timestamp = $this->getTimestamp();
+        $nonce = Str::random(16);
         $url = $this->apiHost . $path;
-        
-        // Sort params alphabetically as the reference does
-        ksort($params);
-        
-        // Create full URL with query params
-        $fullUrl = $url;
-        if (!empty($params)) {
-            $fullUrl .= '?' . http_build_query($params);
-        }
-        
-        // Create body content
         $bodyContent = '';
+        
+        // Convert body to JSON if needed
         if (!empty($body)) {
             $bodyContent = json_encode($body);
         }
         
-        // Build string to sign
-        $stringToSign = $this->buildStringToSign(strtoupper($method), $url, $params, $bodyContent);
+        // Add query parameters if needed
+        $fullUrl = $url;
+        if (!empty($params)) {
+            $queryString = http_build_query($params);
+            $fullUrl .= '?' . $queryString;
+            $path .= '?' . $queryString; // Path with query for signing
+        }
         
-        // Sign with token
-        $sign = $this->calcSign($stringToSign, $token);
+        // Sign request
+        $sign = $this->calcSign(strtoupper($method), $path, $bodyContent, $token);
         
-        $this->debugLog('Making API request', [
+        $this->debugLog('API request details', [
             'method' => $method,
             'url' => $fullUrl,
-            'stringToSign' => $stringToSign
+            'body' => $bodyContent
         ]);
         
-        // Set headers
+        // Set headers based on latest docs
         $headers = [
             'client_id' => $this->accessId,
             'access_token' => $token,
             'sign' => $sign,
-            't' => $timestamp,
+            't' => (string)$timestamp,
             'sign_method' => 'HMAC-SHA256',
-            'nonce' => $nonce,
-            'Content-Type' => 'application/json'
+            'nonce' => $nonce
         ];
         
-        // Store headers for debug
-        $this->headers = $headers;
+        if (!empty($body)) {
+            $headers['Content-Type'] = 'application/json';
+        }
         
-        // Create HTTP client
+        // Make the request
         $client = Http::withHeaders($headers);
         
         // Execute request based on method
@@ -296,7 +255,7 @@ class TuyaClient
         // Parse response
         $data = $response->json();
         
-        // Validate response success similar to reference
+        // Check for error
         if (isset($data['success']) && $data['success'] === false) {
             $errorMsg = isset($data['msg']) ? $data['msg'] : 'Unknown error';
             $errorCode = isset($data['code']) ? $data['code'] : 'unknown';
@@ -304,14 +263,6 @@ class TuyaClient
         }
         
         return $data;
-    }
-
-    /**
-     * Get the last request headers for debugging
-     */
-    public function getLastHeaders()
-    {
-        return $this->headers;
     }
 
     /**
