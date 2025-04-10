@@ -5,6 +5,7 @@ namespace Maxviex\TuyaLaravel;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
 
 class TuyaClient
 {
@@ -13,7 +14,9 @@ class TuyaClient
     protected $accessSecret;
     protected $tokenCacheKey = 'tuya_access_token';
     protected $tokenCacheTime = 7200; // 2 jam, kurang dari masa berlaku token asli
-
+    protected $debug = false;
+    protected $headers = [];
+    
     /**
      * TuyaClient constructor.
      * 
@@ -27,48 +30,161 @@ class TuyaClient
         $this->accessSecret = $accessSecret;
         $this->apiHost = rtrim($apiHost, '/');
     }
+    
+    /**
+     * Enable debug mode
+     */
+    public function enableDebug()
+    {
+        $this->debug = true;
+        return $this;
+    }
+    
+    /**
+     * Debug log helper
+     */
+    protected function debugLog($message, $data = [])
+    {
+        if ($this->debug) {
+            Log::info('TuyaClient Debug: ' . $message, $data);
+        }
+    }
 
     /**
      * Ngambil access token, kalo belum ada atau expired, minta yang baru
      */
     public function getAccessToken()
     {
+        // Untuk debugging, kita bisa clear cache
+        if ($this->debug) {
+            Cache::forget($this->tokenCacheKey);
+        }
+        
         // Cek dulu kalo token-nya masih ada di cache
         if (Cache::has($this->tokenCacheKey)) {
+            $this->debugLog('Using cached token');
             return Cache::get($this->tokenCacheKey);
         }
 
-        // Kalo gak ada, minta token baru
+        $this->debugLog('Requesting new token');
+        
+        // Persiapkan parameter untuk request token
+        // Referensi implementasi: https://github.com/ground-creative/tuyapiphp/blob/master/src/Token.php
         $timestamp = $this->getTimestamp();
-        $stringToSign = $this->accessId . $timestamp;
+        $nonce = Str::random(16);
+        
+        // Sorting parameters by alphabetical order (like what the reference does)
+        $params = [
+            'grant_type' => 1
+        ];
+        
+        // Create URL
+        $url = $this->apiHost . '/v1.0/token';
+        $fullUrl = $url . '?' . http_build_query($params);
+        
+        // Sign string - using method similar to reference
+        $stringToSign = $this->buildStringToSign('GET', $url, $params, '');
         $sign = $this->calcSign($stringToSign);
-
-        $response = Http::withHeaders([
+        
+        $this->debugLog('Token request details', [
+            'url' => $fullUrl,
+            'stringToSign' => $stringToSign,
+            'timestamp' => $timestamp
+        ]);
+        
+        // Set headers
+        $headers = [
             'client_id' => $this->accessId,
             'sign' => $sign,
             't' => $timestamp,
             'sign_method' => 'HMAC-SHA256',
-        ])->get($this->apiHost . '/v1.0/token?grant_type=1');
-
-        // Debug response mentah
+            'nonce' => $nonce,
+            'Content-Type' => 'application/json'
+        ];
+        
+        // Make request
+        $response = Http::withHeaders($headers)->get($fullUrl);
+        
+        $this->debugLog('Token response', [
+            'status' => $response->status(),
+            'body' => $response->body()
+        ]);
+        
+        // Check response
         if (!$response->successful()) {
-            throw new \Exception('Gagal dapetin token: ' . $response->body());
+            throw new \Exception('API error: ' . $response->body());
         }
-
+        
         $data = $response->json();
         
-        // Check if response has the expected structure
+        // Validate response format, similar to reference
+        if (!isset($data['success']) || $data['success'] !== true) {
+            $errorMsg = isset($data['msg']) ? $data['msg'] : 'Unknown error';
+            $errorCode = isset($data['code']) ? $data['code'] : 'unknown';
+            throw new \Exception("API error: {$errorMsg} (Code: {$errorCode})");
+        }
+        
+        // Extract token from response
         if (!isset($data['result']) || !isset($data['result']['access_token'])) {
-            // Return the full response for debugging
-            throw new \Exception('Unexpected API response structure: ' . json_encode($data));
+            throw new \Exception('Token not found in response: ' . json_encode($data));
         }
         
         $token = $data['result']['access_token'];
-
-        // Simpen token ke cache
-        Cache::put($this->tokenCacheKey, $token, $this->tokenCacheTime);
-
+        $this->debugLog('Token obtained successfully');
+        
+        // Simpen token ke cache - using expiration time from response if available
+        $expireTime = isset($data['result']['expire_time']) ? $data['result']['expire_time'] / 1000 - time() - 60 : $this->tokenCacheTime;
+        Cache::put($this->tokenCacheKey, $token, $expireTime);
+        
         return $token;
+    }
+    
+    /**
+     * Build string to sign (like in reference implementation)
+     */
+    protected function buildStringToSign($method, $url, $params = [], $body = '')
+    {
+        $urlParts = parse_url($url);
+        $path = isset($urlParts['path']) ? $urlParts['path'] : '';
+        
+        // Handle headers - blank for now as we don't use them in this implementation
+        $headers = '';
+        
+        // Get query params from URL if any
+        $urlQuery = isset($urlParts['query']) ? $urlParts['query'] : '';
+        
+        // Combine with method params
+        $allParams = [];
+        parse_str($urlQuery, $urlParams);
+        $allParams = array_merge($urlParams, $params);
+        
+        // Sort params similar to reference
+        ksort($allParams);
+        $queryString = http_build_query($allParams);
+        
+        // Prepare body hash
+        $bodyHash = '';
+        if (!empty($body)) {
+            if (is_array($body)) {
+                $body = json_encode($body);
+            }
+            $bodyHash = hash('sha256', $body);
+        } else {
+            $bodyHash = hash('sha256', '');
+        }
+        
+        // Assemble string to sign
+        $stringToSign = $method . "\n" . 
+                        $bodyHash . "\n" .
+                        $headers . "\n" .
+                        $path;
+        
+        // Add query params if exist
+        if (!empty($queryString)) {
+            $stringToSign .= '?' . $queryString;
+        }
+        
+        return $stringToSign;
     }
 
     /**
@@ -76,8 +192,8 @@ class TuyaClient
      */
     protected function calcSign(string $stringToSign, ?string $accessToken = null)
     {
-        $str = $accessToken ? $this->accessSecret . $accessToken : $this->accessSecret;
-        return hash_hmac('sha256', $stringToSign, $str);
+        $key = $accessToken ? $this->accessSecret . $accessToken : $this->accessSecret;
+        return hash_hmac('sha256', $stringToSign, $key);
     }
 
     /**
@@ -96,65 +212,106 @@ class TuyaClient
         $token = $this->getAccessToken();
         $timestamp = $this->getTimestamp();
         $nonce = Str::random(16);
-        $url = $this->apiHost . $path;
-
-        // Bikin query string kalo ada params
-        if (!empty($params)) {
-            $url .= '?' . http_build_query($params);
-        }
-
-        // Bikin string yang mau di-sign
-        $contentToSign = '';
-        if (!empty($body)) {
-            $contentToSign = json_encode($body);
+        
+        // Ensure path starts with /
+        if (substr($path, 0, 1) !== '/') {
+            $path = '/' . $path;
         }
         
-        $stringToSign = strtoupper($method) . "\n" .
-            hash('sha256', $contentToSign) . "\n" .
-            '' . "\n" . // headers kosong
-            $path;
-
-        // Tambahkan query string ke string yang mau di-sign kalo ada
+        $url = $this->apiHost . $path;
+        
+        // Sort params alphabetically as the reference does
+        ksort($params);
+        
+        // Create full URL with query params
+        $fullUrl = $url;
         if (!empty($params)) {
-            $stringToSign .= '?' . http_build_query($params);
+            $fullUrl .= '?' . http_build_query($params);
         }
-
+        
+        // Create body content
+        $bodyContent = '';
+        if (!empty($body)) {
+            $bodyContent = json_encode($body);
+        }
+        
+        // Build string to sign
+        $stringToSign = $this->buildStringToSign(strtoupper($method), $url, $params, $bodyContent);
+        
+        // Sign with token
         $sign = $this->calcSign($stringToSign, $token);
-
-        // Bikin request
-        $response = Http::withHeaders([
+        
+        $this->debugLog('Making API request', [
+            'method' => $method,
+            'url' => $fullUrl,
+            'stringToSign' => $stringToSign
+        ]);
+        
+        // Set headers
+        $headers = [
             'client_id' => $this->accessId,
             'access_token' => $token,
             'sign' => $sign,
             't' => $timestamp,
             'sign_method' => 'HMAC-SHA256',
             'nonce' => $nonce,
-        ]);
-
-        // Tambah body kalo ada
-        if (!empty($body)) {
-            $response = $response->withBody(json_encode($body), 'application/json');
-        }
-
-        // Kirim request sesuai method-nya
+            'Content-Type' => 'application/json'
+        ];
+        
+        // Store headers for debug
+        $this->headers = $headers;
+        
+        // Create HTTP client
+        $client = Http::withHeaders($headers);
+        
+        // Execute request based on method
+        $response = null;
         switch (strtoupper($method)) {
             case 'GET':
-                $response = $response->get($url);
+                $response = $client->get($fullUrl);
                 break;
             case 'POST':
-                $response = $response->post($url, $body);
+                $response = $client->post($fullUrl, $body);
                 break;
             case 'PUT':
-                $response = $response->put($url, $body);
+                $response = $client->put($fullUrl, $body);
                 break;
             case 'DELETE':
-                $response = $response->delete($url, $body);
+                $response = $client->delete($fullUrl, $body);
                 break;
             default:
                 throw new \Exception('Method gak didukung: ' . $method);
         }
+        
+        $this->debugLog('API response', [
+            'status' => $response->status(),
+            'body' => $response->body()
+        ]);
+        
+        // Check response
+        if (!$response->successful()) {
+            throw new \Exception('API error: ' . $response->body());
+        }
+        
+        // Parse response
+        $data = $response->json();
+        
+        // Validate response success similar to reference
+        if (isset($data['success']) && $data['success'] === false) {
+            $errorMsg = isset($data['msg']) ? $data['msg'] : 'Unknown error';
+            $errorCode = isset($data['code']) ? $data['code'] : 'unknown';
+            throw new \Exception("API error: {$errorMsg} (Code: {$errorCode})");
+        }
+        
+        return $data;
+    }
 
-        return $response->json();
+    /**
+     * Get the last request headers for debugging
+     */
+    public function getLastHeaders()
+    {
+        return $this->headers;
     }
 
     /**
