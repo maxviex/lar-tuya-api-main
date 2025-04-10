@@ -1,6 +1,6 @@
 <?php
 
-namespace maxviex\TuyaLaravel;
+namespace Maxviex\TuyaLaravel;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
@@ -50,11 +50,19 @@ class TuyaClient
             'sign_method' => 'HMAC-SHA256',
         ])->get($this->apiHost . '/v1.0/token?grant_type=1');
 
+        // Debug response mentah
         if (!$response->successful()) {
             throw new \Exception('Gagal dapetin token: ' . $response->body());
         }
 
         $data = $response->json();
+        
+        // Check if response has the expected structure
+        if (!isset($data['result']) || !isset($data['result']['access_token'])) {
+            // Return the full response for debugging
+            throw new \Exception('Unexpected API response structure: ' . json_encode($data));
+        }
+        
         $token = $data['result']['access_token'];
 
         // Simpen token ke cache

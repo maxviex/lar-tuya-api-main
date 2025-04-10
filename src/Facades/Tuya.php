@@ -1,11 +1,11 @@
 <?php
 
-namespace maxviex\TuyaLaravel\Facades;
+namespace Maxviex\TuyaLaravel\Facades;
 
 use Illuminate\Support\Facades\Facade;
 
 /**
- * @method static array getAccessToken()
+ * @method static string getAccessToken()
  * @method static array request(string $method, string $path, array $params = [], array $body = [])
  * @method static array get(string $path, array $params = [])
  * @method static array post(string $path, array $body = [], array $params = [])
@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static array getDeviceStatus(string $deviceId)
  * @method static array controlDevice(string $deviceId, array $commands)
  * 
- * @see \maxviex\TuyaLaravel\TuyaClient
+ * @see \Maxviex\TuyaLaravel\TuyaClient
  */
 class Tuya extends Facade
 {

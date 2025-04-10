@@ -1,6 +1,6 @@
 <?php
 
-namespace maxviex\TuyaLaravel;
+namespace Maxviex\TuyaLaravel;
 
 use Illuminate\Support\ServiceProvider;
 
